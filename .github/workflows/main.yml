@@ -1,0 +1,115 @@
+name: Remove Background (60s, Free)
+
+on:
+  workflow_dispatch:
+    inputs:
+      VIDEO_URL:
+        description: "Tùy chọn: URL video để tải (YouTube/TikTok/Twitch...). Bỏ trống để dùng file trong repo."
+        required: false
+        default: ""
+      INPUT_PATH:
+        description: "Đường dẫn file có sẵn trong repo (nếu không dùng VIDEO_URL)"
+        required: false
+        default: "INPUT/input.mp4"
+      FPS:
+        description: "FPS xử lý (24/25/30)"
+        required: false
+        default: "30"
+      MODEL:
+        description: "Model: u2net | u2netp | u2net_human_seg | isnet-general-use (để trống = mặc định)"
+        required: false
+        default: ""
+
+jobs:
+  remove_bg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        run: |
+          mkdir -p INPUT OUT
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Torch (CPU) + BackgroundRemover (+ yt-dlp nếu dùng URL)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+          python -m pip install backgroundremover==0.3.4 yt-dlp
+
+      - name: Cache Torch & Models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/torch
+            ~/.cache/backgroundremover
+            ~/.u2net
+          key: bgrem-${{ runner.os }}-${{ hashFiles('.github/workflows/remove_bg.yml') }}
+
+      - name: Resolve input video (download or use repo file)
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.VIDEO_URL }}" ]; then
+            echo "[INFO] Downloading: ${{ inputs.VIDEO_URL }}"
+            yt-dlp -o INPUT/input.mp4 "${{ inputs.VIDEO_URL }}"
+            SRC="INPUT/input.mp4"
+          else
+            SRC="${{ inputs.INPUT_PATH }}"
+            if [ ! -f "$SRC" ]; then
+              echo "::error::Không tìm thấy file nguồn: $SRC. Hãy commit file vào repo hoặc cung cấp VIDEO_URL."
+              exit 1
+            fi
+          fi
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+
+      - name: Trim to 60s (fast copy; fallback re-encode)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ steps.resolve.outputs.src }}"
+          echo "[INFO] Trim to 60s from: $SRC"
+          if ffmpeg -y -hide_banner -loglevel error -i "$SRC" -t 60 -c copy .tmp_60s.mp4; then
+            echo "[OK] Copy-trim done"
+          else
+            echo "[WARN] Copy-trim failed → re-encode H.264/AAC"
+            ffmpeg -y -hide_banner -loglevel error -i "$SRC" -t 60 -c:v libx264 -preset veryfast -c:a aac .tmp_60s.mp4
+          fi
+
+      - name: Remove background → MOV (alpha)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FPS="${{ inputs.FPS }}"
+          MODEL="${{ inputs.MODEL }}"
+          if [ -n "$MODEL" ]; then M="-m $MODEL"; else M=""; fi
+          echo "[INFO] backgroundremover -fr $FPS $M -tv"
+          backgroundremover -i .tmp_60s.mp4 -fr "$FPS" $M -tv -o OUT/cutout.mov
+
+      - name: Remux MP4 (no alpha) + copy original audio
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg -y -hide_banner -loglevel error -i OUT/cutout.mov -i .tmp_60s.mp4 \
+            -map 0:v -map 1:a? -c:v libx264 -pix_fmt yuv420p -shortest OUT/out.mp4
+          echo "[OK] Created:"
+          ls -lh OUT/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: remove-bg-results
+          path: OUT/
