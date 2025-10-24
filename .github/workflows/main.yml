@@ -1,24 +1,28 @@
-name: Remove Background → MP4 nền đen (No Audio, Full Length)
+name: Remove BG to MP4 (black, no-audio, full, pinned u2net_human_seg)
 
 on:
   workflow_dispatch:
     inputs:
       VIDEO_URL:
-        description: "Tùy chọn: URL video để tải (YouTube/TikTok/Twitch...). Bỏ trống để dùng file trong repo."
+        description: "URL video (tùy chọn). Bỏ trống để dùng file trong repo."
         required: false
         default: ""
       INPUT_PATH:
-        description: "Đường dẫn file có sẵn trong repo (nếu không dùng VIDEO_URL)"
+        description: "Đường dẫn file trong repo (khi không dùng VIDEO_URL)"
         required: false
         default: "INPUT/input.mp4"
       FPS:
         description: "FPS xử lý (24/25/30)"
         required: false
         default: "30"
-      MODEL:
-        description: "Model (tuỳ chọn): u2net | u2netp | u2net_human_seg | isnet-general-use"
+      ERODE_PASSES:
+        description: "Co viền alpha (deflate passes), đề xuất 2–3"
         required: false
-        default: ""
+        default: "2"
+      FEATHER:
+        description: "Làm mượt viền alpha (px). 0 = tắt"
+        required: false
+        default: "1"
 
 jobs:
   remove_bg:
@@ -36,14 +40,16 @@ jobs:
           mkdir -p INPUT OUT .work
 
       - name: Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install Torch (CPU) + BackgroundRemover (+ yt-dlp nếu dùng URL)
+      - name: Install Torch + BackgroundRemover (+ yt-dlp if URL)
         run: |
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
@@ -56,9 +62,9 @@ jobs:
             ~/.cache/torch
             ~/.cache/backgroundremover
             ~/.u2net
-          key: bgrem-${{ runner.os }}-${{ hashFiles('.github/workflows/remove_bg.yml') }}
+          key: bgrem-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
 
-      - name: Resolve input video (download or use repo file)
+      - name: Resolve input video
         id: resolve
         shell: bash
         run: |
@@ -70,46 +76,69 @@ jobs:
           else
             SRC="${{ inputs.INPUT_PATH }}"
             if [ ! -f "$SRC" ]; then
-              echo "::error::Không tìm thấy file nguồn: $SRC. Hãy commit file vào repo hoặc cung cấp VIDEO_URL."
+              echo "::error::Không tìm thấy file: $SRC"
               exit 1
             fi
           fi
           echo "src=$SRC" >> "$GITHUB_OUTPUT"
 
-      - name: Remove background → TEMP MOV (alpha, full length)
+      - name: Remove background to temp RGBA (pinned model u2net_human_seg)
         shell: bash
         run: |
           set -euo pipefail
           SRC="${{ steps.resolve.outputs.src }}"
           FPS="${{ inputs.FPS }}"
-          MODEL="${{ inputs.MODEL }}"
-          if [ -n "$MODEL" ]; then M="-m $MODEL"; else M=""; fi
-          echo "[INFO] backgroundremover -i \"$SRC\" -fr $FPS $M -tv -o .work/cutout_tmp.mov"
-          backgroundremover -i "$SRC" -fr "$FPS" $M -tv -o .work/cutout_tmp.mov
+          backgroundremover -i "$SRC" -fr "$FPS" -m u2net_human_seg -tv -o .work/cutout_tmp.mov
 
-      - name: Flatten to MP4 (BLACK BG, NO AUDIO)
+      - name: Flatten to MP4 (black bg, no audio) with anti-halo
         shell: bash
         run: |
           set -euo pipefail
-          # Ghép foreground (alpha) lên nền ĐEN. Không xuất audio (-an).
-          # scale2ref để nền khớp kích thước video foreground.
+          P=${{ inputs.ERODE_PASSES }}
+          FEATHER=${{ inputs.FEATHER }}
+
+          # Build deflate chain P times (co viền alpha)
+          DFLT=""
+          if [ "$P" -gt 0 ]; then
+            for _ in $(seq 1 "$P"); do DFLT="${DFLT}deflate,"; done
+            DFLT="${DFLT%,}"
+          fi
+
+          # Feather alpha via boxblur on alpha plane only
+          if [ "$FEATHER" -eq 0 ]; then
+            BLUR_ALPHA="boxblur=0:1"
+          else
+            BLUR_ALPHA="boxblur=0:1:cr=0:ar=${FEATHER}:ap=1"
+          fi
+
+          # Compose filter graph
+          FG="[1:v]format=rgba,split=2[vid][a];[a]alphaextract,${BLUR_ALPHA}"
+          if [ -n "$DFLT" ]; then
+            FG="${FG},${DFLT}"
+          fi
+          FG="${FG}[am];[vid][am]alphamerge[fg];[0:v][fg]scale2ref[bg][fg2];[bg][fg2]overlay=shortest=1"
+
+          echo "[INFO] filter_complex: $FG"
+
+          # Background black (auto scale to FG via scale2ref), no audio (-an)
           ffmpeg -y -hide_banner -loglevel error \
             -f lavfi -i color=c=black:s=16x16:d=999999 \
             -i .work/cutout_tmp.mov \
-            -filter_complex "[1:v]format=rgba[fg];[0:v][fg]scale2ref[bg][fg2];[bg][fg2]overlay=shortest=1" \
+            -filter_complex "$FG" \
             -an -c:v libx264 -pix_fmt yuv420p OUT/out.mp4
 
-      - name: Cleanup temp alpha
+      - name: Cleanup temp
         shell: bash
         run: |
           rm -f .work/cutout_tmp.mov
-          echo "[OK] out.mp4 ready (nền đen, không tiếng)."
+          echo "[OK] OUT/out.mp4 ready (black bg, no audio)."
 
       - name: List outputs
-        run: ls -lh OUT/
+        run: |
+          ls -lh OUT/
 
-      - name: Upload artifact (out.mp4 only)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: remove-bg-out
+          name: out-black-noaudio
           path: OUT/out.mp4
