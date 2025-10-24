@@ -1,4 +1,4 @@
-name: Remove BG (batch INPUT → MP4 nền đen, no-audio, full)
+name: Remove BG (batch in order → MP4 nền đen, no-audio, full)
 
 on:
   workflow_dispatch:
@@ -7,12 +7,20 @@ on:
         description: "FPS xử lý (24/25/30)"
         required: false
         default: "30"
-      ERODE_PASSES:
-        description: "Co viền alpha (deflate) bao nhiêu lần? (2–3 đề xuất)"
+      MAX_FILES:
+        description: "Số video đầu tiên trong INPUT/ cần xử lý (0 = tất cả)"
         required: false
-        default: "2"
+        default: "0"
+      CLOSE_PASSES:
+        description: "Đóng lỗ alpha (dilation→erosion) bao nhiêu lần? (1–2 đề xuất)"
+        required: false
+        default: "1"
+      ERODE_PASSES:
+        description: "Co viền alpha (erosion) để giảm lem (0–2)"
+        required: false
+        default: "1"
       FEATHER:
-        description: "Feather alpha (px), 0 = tắt (1–2 đề xuất)"
+        description: "Feather (làm mượt alpha) theo px (0–2)"
         required: false
         default: "1"
 
@@ -57,27 +65,36 @@ jobs:
             ~/.u2net
           key: bgrem-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
 
-      - name: Batch process INPUT/* in order (u2net_human_seg, anti-halo)
+      - name: Batch process INPUT/* in order (pin u2net_human_seg + alpha-matting)
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob nocaseglob
 
           FPS="${{ inputs.FPS }}"
-          P="${{ inputs.ERODE_PASSES }}"
+          LIMIT="${{ inputs.MAX_FILES }}"
+          CLOSE="${{ inputs.CLOSE_PASSES }}"
+          ERODE="${{ inputs.ERODE_PASSES }}"
           FEATHER="${{ inputs.FEATHER }}"
 
-          # Lấy tất cả file video trong INPUT theo thứ tự tên (lexicographic)
+          # Thu thập file theo pattern
           files=(INPUT/*.mp4 INPUT/*.mov INPUT/*.mkv INPUT/*.avi INPUT/*.webm)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::Không tìm thấy video trong thư mục INPUT/."
+            echo "::error::Không tìm thấy video trong INPUT/."
             exit 1
           fi
 
-          echo "[INFO] Sẽ xử lý lần lượt ${#files[@]} file:"
-          printf ' - %s\n' "${files[@]}"
+          # Sắp xếp theo tên (không phân biệt hoa thường), cắt theo LIMIT
+          if [ -z "$LIMIT" ] || [ "$LIMIT" = "0" ]; then
+            mapfile -t ordered < <(printf '%s\n' "${files[@]}" | sort -f)
+          else
+            mapfile -t ordered < <(printf '%s\n' "${files[@]}" | sort -f | head -n "$LIMIT")
+          fi
 
-          for SRC in "${files[@]}"; do
+          echo "[INFO] Sẽ xử lý lần lượt ${#ordered[@]} file:"
+          printf ' - %s\n' "${ordered[@]}"
+
+          for SRC in "${ordered[@]}"; do
             echo
             echo "======== PROCESS: $SRC ========"
 
@@ -85,32 +102,38 @@ jobs:
             TMP=".work/${STEM}.mov"
             OUT_MP4="OUT/${STEM}.mp4"
 
-            echo "[STEP] Tách nền → RGBA (u2net_human_seg)"
-            if ! backgroundremover -i "$SRC" -fr "$FPS" -m u2net_human_seg -tv -o "$TMP"; then
+            echo "[STEP] Remove BG → RGBA (u2net_human_seg + alpha-matting)"
+            if ! backgroundremover -i "$SRC" -fr "$FPS" -m u2net_human_seg -a -tv -o "$TMP"; then
               echo "::error::BackgroundRemover lỗi ở file: $SRC"
               continue
             fi
 
-            echo "[STEP] Chống lem viền (deflate + feather) & ghép nền đen → MP4, no-audio"
-            # Chuỗi deflate P lần (co viền alpha)
-            DFLT=""
-            if [ "$P" -gt 0 ]; then
-              for _ in $(seq 1 "$P"); do DFLT="${DFLT}deflate,"; done
-              DFLT="${DFLT%,}"
-            fi
-
             # Feather alpha (boxblur chỉ trên kênh alpha)
             if [ "$FEATHER" -eq 0 ]; then
-              BLUR_ALPHA="boxblur=0:1"
+              BLUR_ALPHA="boxblur=0:1:0:1:0:1"
             else
-              BLUR_ALPHA="boxblur=0:1:cr=0:ar=${FEATHER}:ap=1"
+              BLUR_ALPHA="boxblur=0:1:0:1:${FEATHER}:1"
             fi
 
+            # Chuỗi đóng lỗ (CLOSE = dilation→erosion) và co viền (ERODE = erosion)
+            MORPH=""
+            if [ "$CLOSE" -gt 0 ]; then
+              for _ in $(seq 1 "$CLOSE"); do MORPH="${MORPH}dilation,erosion,"; done
+            fi
+            if [ "$ERODE" -gt 0 ]; then
+              for _ in $(seq 1 "$ERODE"); do MORPH="${MORPH}erosion,"; done
+            fi
+            MORPH="${MORPH%,}"
+
+            # Filter graph: tách alpha → feather → (close/erode) → ghép alpha → overlay nền đen
             FG="[1:v]format=rgba,split=2[vid][a];[a]alphaextract,${BLUR_ALPHA}"
-            if [ -n "$DFLT" ]; then
-              FG="${FG},${DFLT}"
+            if [ -n "$MORPH" ]; then
+              FG="${FG},${MORPH}"
             fi
             FG="${FG}[am];[vid][am]alphamerge[fg];[0:v][fg]scale2ref[bg][fg2];[bg][fg2]overlay=shortest=1"
+
+            echo "[STEP] Flatten → MP4 (black bg, no-audio) – filter_complex:"
+            echo "$FG"
 
             if ! ffmpeg -y -hide_banner -loglevel error \
               -f lavfi -i color=c=black:s=16x16:d=999999 \
