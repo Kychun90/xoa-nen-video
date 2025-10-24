@@ -1,4 +1,4 @@
-name: Remove Background (60s, Free)
+name: Remove Background (Full, No Audio, No Trim)
 
 on:
   workflow_dispatch:
@@ -16,14 +16,14 @@ on:
         required: false
         default: "30"
       MODEL:
-        description: "Model: u2net | u2netp | u2net_human_seg | isnet-general-use (để trống = mặc định)"
+        description: "Model (tuỳ chọn): u2net | u2netp | u2net_human_seg | isnet-general-use"
         required: false
         default: ""
 
 jobs:
   remove_bg:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       contents: read
 
@@ -76,37 +76,31 @@ jobs:
           fi
           echo "src=$SRC" >> "$GITHUB_OUTPUT"
 
-      - name: Trim to 60s (fast copy; fallback re-encode)
+      - name: Remove background → MOV (alpha, full length)
         shell: bash
         run: |
           set -euo pipefail
           SRC="${{ steps.resolve.outputs.src }}"
-          echo "[INFO] Trim to 60s from: $SRC"
-          if ffmpeg -y -hide_banner -loglevel error -i "$SRC" -t 60 -c copy .tmp_60s.mp4; then
-            echo "[OK] Copy-trim done"
-          else
-            echo "[WARN] Copy-trim failed → re-encode H.264/AAC"
-            ffmpeg -y -hide_banner -loglevel error -i "$SRC" -t 60 -c:v libx264 -preset veryfast -c:a aac .tmp_60s.mp4
-          fi
-
-      - name: Remove background → MOV (alpha)
-        shell: bash
-        run: |
-          set -euo pipefail
           FPS="${{ inputs.FPS }}"
           MODEL="${{ inputs.MODEL }}"
           if [ -n "$MODEL" ]; then M="-m $MODEL"; else M=""; fi
-          echo "[INFO] backgroundremover -fr $FPS $M -tv"
-          backgroundremover -i .tmp_60s.mp4 -fr "$FPS" $M -tv -o OUT/cutout.mov
+          echo "[INFO] backgroundremover -i \"$SRC\" -fr $FPS $M -tv -o OUT/cutout.mov"
+          backgroundremover -i "$SRC" -fr "$FPS" $M -tv -o OUT/cutout.mov
 
-      - name: Remux MP4 (no alpha) + copy original audio
+      - name: Flatten to MP4 (white bg, NO AUDIO)
         shell: bash
         run: |
           set -euo pipefail
-          ffmpeg -y -hide_banner -loglevel error -i OUT/cutout.mov -i .tmp_60s.mp4 \
-            -map 0:v -map 1:a? -c:v libx264 -pix_fmt yuv420p -shortest OUT/out.mp4
-          echo "[OK] Created:"
-          ls -lh OUT/
+          # Ghép cutout.mov (có alpha) lên nền TRẮNG, tự scale nền khớp kích thước foreground.
+          # Không map audio (-an).
+          ffmpeg -y -hide_banner -loglevel error \
+            -f lavfi -i color=c=white:s=16x16:d=999999 \
+            -i OUT/cutout.mov \
+            -filter_complex "[1:v]format=rgba[fg];[0:v][fg]scale2ref[bg][fg2];[bg][fg2]overlay=shortest=1" \
+            -an -c:v libx264 -pix_fmt yuv420p OUT/out.mp4
+
+      - name: List outputs
+        run: ls -lh OUT/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
