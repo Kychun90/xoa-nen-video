@@ -1,4 +1,4 @@
-name: Remove BG (batch in order → MP4 nền đen, no-audio, full)
+name: Remove BG (batch → MP4 nền xanh, no-audio, full)
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
             exit 1
           fi
 
-          # Sắp xếp theo tên (không phân biệt hoa thường), cắt theo LIMIT
+          # Sắp xếp theo tên (case-insensitive), lấy MAX_FILES đầu nếu có
           if [ -z "$LIMIT" ] || [ "$LIMIT" = "0" ]; then
             mapfile -t ordered < <(printf '%s\n' "${files[@]}" | sort -f)
           else
@@ -125,18 +125,19 @@ jobs:
             fi
             MORPH="${MORPH%,}"
 
-            # Filter graph: tách alpha → feather → (close/erode) → ghép alpha → overlay nền đen
+            # Filter graph: tách alpha → feather → (close/erode) → ghép alpha → overlay nền XANH (lime)
             FG="[1:v]format=rgba,split=2[vid][a];[a]alphaextract,${BLUR_ALPHA}"
             if [ -n "$MORPH" ]; then
               FG="${FG},${MORPH}"
             fi
             FG="${FG}[am];[vid][am]alphamerge[fg];[0:v][fg]scale2ref[bg][fg2];[bg][fg2]overlay=shortest=1"
 
-            echo "[STEP] Flatten → MP4 (black bg, no-audio) – filter_complex:"
+            echo "[STEP] Flatten → MP4 (green bg, no-audio) – filter_complex:"
             echo "$FG"
 
+            # Nền xanh sáng #00FF00 (lime) để dễ key
             if ! ffmpeg -y -hide_banner -loglevel error \
-              -f lavfi -i color=c=black:s=16x16:d=999999 \
+              -f lavfi -i color=c=lime:s=16x16:d=999999 \
               -i "$TMP" \
               -filter_complex "$FG" \
               -an -c:v libx264 -pix_fmt yuv420p "$OUT_MP4"; then
@@ -159,5 +160,5 @@ jobs:
       - name: Upload OUT/*.mp4
         uses: actions/upload-artifact@v4
         with:
-          name: out-black-noaudio-batch
+          name: out-green-noaudio-batch
           path: OUT/*.mp4
